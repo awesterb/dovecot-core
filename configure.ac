@@ -307,6 +307,8 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([
 #endif
 ])], [], AC_MSG_ERROR([Version macros broken]))
 
+AC_CHECK_LIB([zfs], [libzfs_init])
+
 AC_CHECK_HEADERS(strings.h stdint.h unistd.h dirent.h malloc.h \
   sys/uio.h sys/sysmacros.h sys/resource.h sys/select.h libgen.h \
   sys/quota.h sys/fs/ufs_quota.h ufs/ufs/quota.h jfs/quota.h \

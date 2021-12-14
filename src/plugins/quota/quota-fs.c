@@ -66,6 +66,10 @@ struct fs_quota_mountpoint {
 	int fd;
 	char *path;
 #endif
+
+#ifdef HAVE_ZFS
+	zfs_handle_t *zfsh;
+#endif
 };
 
 struct fs_quota_root {
@@ -82,6 +86,10 @@ struct fs_quota_root {
 #ifdef FS_QUOTA_NETBSD
 	struct quotahandle *qh;
 #endif
+
+#ifdef HAVE_ZFS
+	libzfs_handle_t *zfsh;
+#endif
 };
 
 extern struct quota_backend quota_backend_fs;
@@ -93,6 +101,10 @@ static struct quota_root *fs_quota_alloc(void)
 	root = i_new(struct fs_quota_root, 1);
 	root->uid = geteuid();
 	root->gid = getegid();
+
+#ifdef HAVE_ZFS
+	root->zfsh = NULL;
+#endif
 
 	return &root->root;
 }
@@ -149,6 +161,12 @@ static void fs_quota_mountpoint_free(struct fs_quota_mountpoint *mount)
 	i_free(mount->path);
 #endif
 
+#ifdef HAVE_ZFS
+	if (mount->zfsh != NULL) {
+		zfs_close(mount->zfsh);
+	}
+#endif
+
 	i_free(mount->device_path);
 	i_free(mount->mount_path);
 	i_free(mount->type);
@@ -162,6 +180,12 @@ static void fs_quota_deinit(struct quota_root *_root)
 	if (root->mount != NULL)
 		fs_quota_mountpoint_free(root->mount);
 	i_free(root->storage_mount_path);
+#ifdef HAVE_ZFS
+	if (root->zfsh != NULL) {
+		libzfs_fini(root->zfsh);
+	}
+#endif
+
 	i_free(root);
 }
 
@@ -184,6 +208,10 @@ static struct fs_quota_mountpoint *fs_quota_mountpoint_get(const char *dir)
 #ifdef FS_QUOTA_SOLARIS
 	mount->fd = -1;
 #endif
+#ifdef HAVE_ZFS
+	mount->zfsh = NULL;
+#endif
+
 
 	if (mount_type_is_nfs(mount)) {
 		if (strchr(mount->device_path, ':') == NULL) {
@@ -243,6 +271,24 @@ fs_quota_mount_init(struct fs_quota_root *root,
 		if (mount->fd == -1 && errno != ENOENT)
 			e_error(root->root.backend.event,
 				"open(%s) failed: %m", mount->path);
+	}
+#endif
+
+#ifdef HAVE_ZFS
+	if (strcmp(mount->type, "zfs") == 0) {
+		if (root->zfsh == NULL 
+				&& (root->zfsh = libzfs_init()) == NULL) {
+			e_error(root->root.backend.event,
+				"libzfs_init() failed");
+		}
+
+		mount->zfsh = zfs_path_to_zhandle(root->zfsh, 
+				mount->mount_path, ZFS_TYPE_FILESYSTEM);
+		if (mount->zfsh == NULL) {
+			e_error(root->root.backend.event,
+				"zfs_path_to_zhandle(%s) failed", 
+				mount->mount_path);
+		}
 	}
 #endif
 	root->mount = mount;
@@ -642,6 +688,31 @@ fs_quota_get_linux(struct fs_quota_root *root, bool group,
 }
 #endif
 
+#ifdef HAVE_ZFS
+static int
+fs_quota_get_zfs(struct fs_quota_root *root, bool group,
+		 uint64_t *bytes_value_r, uint64_t *bytes_limit_r,
+		 uint64_t *count_value_r, uint64_t *count_limit_r,
+		 const char **error_r)
+{
+	int q = 0;
+	int qa = 0;
+
+	*bytes_value_r = zfs_prop_get_int(root->mount->zfsh, ZFS_PROP_USED);
+
+	// compute minimum of quota and refquota
+	q = zfs_prop_get_int(root->mount->zfsh, ZFS_PROP_QUOTA);
+	if ((qa = zfs_prop_get_int(root->mount->zfsh, ZFS_PROP_REFQUOTA)) != 0
+		       && qa < q) {
+		q = qa;
+	}
+	*bytes_limit_r = q;
+
+	return 1;
+}
+
+#endif
+
 #ifdef FS_QUOTA_BSDAIX
 static int
 fs_quota_get_bsdaix(struct fs_quota_root *root, bool group,
@@ -817,6 +888,16 @@ fs_quota_get_resources(struct fs_quota_root *root, bool group,
 		if (root->user_disabled)
 			return 0;
 	}
+
+#ifdef HAVE_ZFS
+	if (strcmp(root->mount->type, "zfs") == 0) {
+		return fs_quota_get_zfs(root, group, 
+				bytes_value_r, bytes_limit_r, 
+				count_value_r, count_limit_r, error_r);
+		
+	}
+#endif
+
 #ifdef FS_QUOTA_LINUX
 	return fs_quota_get_linux(root, group, bytes_value_r, bytes_limit_r,
 				  count_value_r, count_limit_r, error_r);

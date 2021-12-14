@@ -6,9 +6,43 @@
 #  define HAVE_FS_QUOTA
 #endif
 
+
 #ifdef HAVE_QUOTA_OPEN
 /* absolute path to avoid confusion with ./quota.h */
 #  include "/usr/include/quota.h" /* NetBSD with libquota */
+#endif
+
+#ifdef HAVE_LIBZFS
+#  define HAVE_ZFS
+
+#include <stdint.h> /* uint64_t */
+
+typedef void libzfs_handle_t;
+
+extern libzfs_handle_t *libzfs_init (void);
+extern void libzfs_fini (libzfs_handle_t *);
+
+typedef enum {
+	ZFS_TYPE_FILESYSTEM	= (1 << 0),
+	/* ... */
+} zfs_type_t;
+
+typedef void zfs_handle_t;
+extern zfs_handle_t *zfs_path_to_zhandle(libzfs_handle_t *, const char *,
+		zfs_type_t);
+extern void zfs_close(zfs_handle_t *);
+
+typedef enum {
+	ZPROP_INVAL = -1,
+	/* ... */
+	ZFS_PROP_USED = 97-95,
+	ZFS_PROP_QUOTA = 103-95,
+	ZFS_PROP_REFQUOTA = 135-95,
+	/* ... */
+} zfs_prop_t;
+
+extern uint64_t zfs_prop_get_int(zfs_handle_t *, zfs_prop_t);
+
 #endif
 
 #ifdef HAVE_SYS_QUOTA_H
