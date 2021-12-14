@@ -27,9 +27,11 @@
 #define LOGIN_PROXY_DIE_IDLE_SECS 2
 #define LOGIN_PROXY_IPC_PATH "ipc-proxy"
 #define LOGIN_PROXY_IPC_NAME "proxy"
-#define KILLED_BY_ADMIN_REASON "Disconnected by proxy: Kicked by admin"
-#define KILLED_BY_DIRECTOR_REASON "Disconnected by proxy: Kicked via director"
-#define KILLED_BY_SHUTDOWN_REASON "Disconnected by proxy: Process shutting down"
+#define LOGIN_PROXY_KILL_PREFIX "Disconnected by proxy: "
+#define KILLED_BY_ADMIN_REASON "Kicked by admin"
+#define KILLED_BY_DIRECTOR_REASON "Kicked via director"
+#define KILLED_BY_SHUTDOWN_REASON "Process shutting down"
+#define LOGIN_PROXY_SIDE_SELF "proxy"
 /* Wait this long before retrying on reconnect */
 #define PROXY_CONNECT_RETRY_MSECS 1000
 /* Don't even try to reconnect if proxying will timeout in less than this. */
@@ -93,7 +95,9 @@ static void login_proxy_ipc_cmd(struct ipc_cmd *cmd, const char *line);
 static void login_proxy_free_final(struct login_proxy *proxy);
 
 static void ATTR_NULL(2)
-login_proxy_free_full(struct login_proxy **_proxy, const char *reason,
+login_proxy_free_full(struct login_proxy **_proxy, const char *log_msg,
+		      const char *disconnect_side,
+		      const char *disconnect_reason,
 		      enum login_proxy_free_flags flags);
 
 static time_t proxy_last_io(struct login_proxy *proxy)
@@ -111,28 +115,29 @@ static void login_proxy_free_errstr(struct login_proxy **_proxy,
 				    const char *errstr, bool server)
 {
 	struct login_proxy *proxy = *_proxy;
-	string_t *reason = t_str_new(128);
+	string_t *log_msg = t_str_new(128);
+	const char *disconnect_side = server ? "server" : "client";
 
-	str_printfa(reason, "Disconnected by %s", server ? "server" : "client");
+	str_printfa(log_msg, "Disconnected by %s", disconnect_side);
 	if (errstr[0] != '\0')
-		str_printfa(reason, ": %s", errstr);
+		str_printfa(log_msg, ": %s", errstr);
 
-	str_printfa(reason, " (%ds idle, in=%"PRIuUOFF_T", out=%"PRIuUOFF_T,
+	str_printfa(log_msg, " (%ds idle, in=%"PRIuUOFF_T", out=%"PRIuUOFF_T,
 		    (int)(ioloop_time - proxy_last_io(proxy)),
 		    proxy->server_output->offset, proxy->client_output->offset);
 	if (o_stream_get_buffer_used_size(proxy->client_output) > 0) {
-		str_printfa(reason, "+%zu",
+		str_printfa(log_msg, "+%zu",
 			    o_stream_get_buffer_used_size(proxy->client_output));
 	}
 	if (iostream_proxy_is_waiting_output(proxy->iostream_proxy,
 					     LOGIN_PROXY_SIDE_SERVER))
-		str_append(reason, ", client output blocked");
+		str_append(log_msg, ", client output blocked");
 	if (iostream_proxy_is_waiting_output(proxy->iostream_proxy,
 					     LOGIN_PROXY_SIDE_CLIENT))
-		str_append(reason, ", server output blocked");
+		str_append(log_msg, ", server output blocked");
 
-	str_append_c(reason, ')');
-	login_proxy_free_full(_proxy, str_c(reason),
+	str_append_c(log_msg, ')');
+	login_proxy_free_full(_proxy, str_c(log_msg), errstr, disconnect_side,
 			      server ? LOGIN_PROXY_FREE_FLAG_DELAYED : 0);
 }
 
@@ -523,7 +528,9 @@ static unsigned int login_proxy_delay_disconnect(struct login_proxy *proxy)
 }
 
 static void ATTR_NULL(2)
-login_proxy_free_full(struct login_proxy **_proxy, const char *reason,
+login_proxy_free_full(struct login_proxy **_proxy, const char *log_msg,
+		      const char *disconnect_reason,
+		      const char *disconnect_side,
 		      enum login_proxy_free_flags flags)
 {
 	struct login_proxy *proxy = *_proxy;
@@ -536,34 +543,43 @@ login_proxy_free_full(struct login_proxy **_proxy, const char *reason,
 		return;
 	proxy->destroying = TRUE;
 
-	/* we'll disconnect server side in any case. */
-	login_proxy_disconnect(proxy);
-
 	struct event_passthrough *e = event_create_passthrough(proxy->event)->
+		add_str("disconnect_reason", disconnect_reason)->
+		add_str("disconnect_side", disconnect_side)->
 		set_name("proxy_session_finished");
 
 	if (proxy->detached) {
+		i_assert(proxy->connected);
+		e->add_int("idle_secs", ioloop_time - proxy_last_io(proxy));
+		e->add_int("bytes_in", proxy->server_output->offset);
+		e->add_int("bytes_out", proxy->client_output->offset);
+	}
+
+	/* we'll disconnect server side in any case. */
+	login_proxy_disconnect(proxy);
+
+	if (proxy->detached) {
 		/* detached proxy */
-		i_assert(reason != NULL || proxy->client->destroyed);
+		i_assert(log_msg != NULL || proxy->client->destroyed);
 		DLLIST_REMOVE(&login_proxies, proxy);
 
 		if ((flags & LOGIN_PROXY_FREE_FLAG_DELAYED) != 0)
 			delay_ms = login_proxy_delay_disconnect(proxy);
 
 		if (delay_ms == 0)
-			e_info(e->event(), "%s", reason);
+			e_info(e->event(), "%s", log_msg);
 		else {
 			e_info(e->add_int("delay_ms", delay_ms)->event(),
 			       "%s - disconnecting client in %ums",
-			       reason, delay_ms);
+			       log_msg, delay_ms);
 		}
 		i_assert(detached_login_proxies_count > 0);
 		detached_login_proxies_count--;
 	} else {
 		i_assert(proxy->client_input == NULL);
 		i_assert(proxy->client_output == NULL);
-		if (reason != NULL)
-			e_debug(e->event(), "%s", reason);
+		if (log_msg != NULL)
+			e_debug(e->event(), "%s", log_msg);
 		else
 			e_debug(e->event(), "Failed to connect to %s",
 				login_proxy_get_ip_str(proxy));
@@ -587,7 +603,7 @@ void login_proxy_free(struct login_proxy **_proxy)
 
 	i_assert(!proxy->detached || proxy->client->destroyed);
 	/* Note: The NULL error is never even attempted to be used here. */
-	login_proxy_free_full(_proxy, NULL, 0);
+	login_proxy_free_full(_proxy, NULL, "", LOGIN_PROXY_SIDE_SELF, 0);
 }
 
 bool login_proxy_failed(struct login_proxy *proxy, struct event *event,
@@ -847,7 +863,10 @@ int login_proxy_starttls(struct login_proxy *proxy)
 
 static void proxy_kill_idle(struct login_proxy *proxy)
 {
-	login_proxy_free_full(&proxy, KILLED_BY_SHUTDOWN_REASON, 0);
+	login_proxy_free_full(&proxy,
+		LOGIN_PROXY_KILL_PREFIX KILLED_BY_SHUTDOWN_REASON,
+		KILLED_BY_SHUTDOWN_REASON,
+		LOGIN_PROXY_SIDE_SELF, 0);
 }
 
 void login_proxy_kill_idle(void)
@@ -921,8 +940,11 @@ login_proxy_cmd_kick_full(struct ipc_cmd *cmd, const char *const *args,
 		next = proxy->next;
 
 		if (want_kick(proxy, args, key_idx)) {
-			login_proxy_free_full(&proxy, KILLED_BY_ADMIN_REASON,
-					      LOGIN_PROXY_FREE_FLAG_DELAYED);
+			login_proxy_free_full(&proxy,
+				LOGIN_PROXY_KILL_PREFIX KILLED_BY_ADMIN_REASON,
+				KILLED_BY_ADMIN_REASON,
+				LOGIN_PROXY_SIDE_SELF,
+				LOGIN_PROXY_FREE_FLAG_DELAYED);
 			count++;
 		}
 	} T_END;
@@ -930,7 +952,9 @@ login_proxy_cmd_kick_full(struct ipc_cmd *cmd, const char *const *args,
 		next = proxy->next;
 
 		if (want_kick(proxy, args, key_idx)) {
-			client_disconnect(proxy->client, KILLED_BY_ADMIN_REASON, FALSE);
+			client_disconnect(proxy->client,
+				LOGIN_PROXY_KILL_PREFIX KILLED_BY_ADMIN_REASON,
+				FALSE);
 			client_destroy(proxy->client, NULL);
 			count++;
 		}
@@ -1020,8 +1044,11 @@ login_proxy_cmd_kick_director_hash(struct ipc_cmd *cmd, const char *const *args)
 		if (director_username_hash(proxy->client, &proxy_hash) &&
 		    proxy_hash == hash &&
 		    !net_ip_compare(&proxy->ip, &except_ip)) {
-			login_proxy_free_full(&proxy, KILLED_BY_DIRECTOR_REASON,
-					      LOGIN_PROXY_FREE_FLAG_DELAYED);
+			login_proxy_free_full(&proxy,
+				LOGIN_PROXY_KILL_PREFIX KILLED_BY_DIRECTOR_REASON,
+				KILLED_BY_DIRECTOR_REASON,
+				LOGIN_PROXY_SIDE_SELF,
+				LOGIN_PROXY_FREE_FLAG_DELAYED);
 			count++;
 		}
 	}
@@ -1031,7 +1058,9 @@ login_proxy_cmd_kick_director_hash(struct ipc_cmd *cmd, const char *const *args)
 		if (director_username_hash(proxy->client, &proxy_hash) &&
 		    proxy_hash == hash &&
 		    !net_ip_compare(&proxy->ip, &except_ip)) {
-			client_disconnect(proxy->client, KILLED_BY_DIRECTOR_REASON, FALSE);
+			client_disconnect(proxy->client,
+				LOGIN_PROXY_KILL_PREFIX KILLED_BY_DIRECTOR_REASON,
+				FALSE);
 			client_destroy(proxy->client, NULL);
 			count++;
 		}
@@ -1129,7 +1158,10 @@ void login_proxy_deinit(void)
 
 	while (login_proxies != NULL) {
 		proxy = login_proxies;
-		login_proxy_free_full(&proxy, KILLED_BY_SHUTDOWN_REASON, 0);
+		login_proxy_free_full(&proxy,
+			LOGIN_PROXY_KILL_PREFIX KILLED_BY_SHUTDOWN_REASON,
+			KILLED_BY_SHUTDOWN_REASON,
+			LOGIN_PROXY_SIDE_SELF, 0);
 	}
 	i_assert(detached_login_proxies_count == 0);
 
